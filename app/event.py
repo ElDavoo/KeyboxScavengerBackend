@@ -499,7 +499,7 @@ async def keybox_check(bot, message, document):
 
     if special_serial_violation:
         reply += "\n❌ Serial f92009e853b6b045 is only allowed on certificate 3 or 4 if more than 3."
-        if has_leaked_serial and not has_banned_serial:
+        if has_leaked_serial and not has_banned_serial and is_not_revoked:
             reply += "\n🟡 Since this keybox was in a leak it can be soft banned and if yes you will get only device integrity"
         else:
             reply += "\n🔴 This key box *can't be used* for strong integrity"
@@ -526,10 +526,10 @@ async def keybox_check(bot, message, document):
             "\n\nSometimes Google bans a keybox without revoking it, so for now no one can detect that ban. This is a reminder: this bot fetches the Google revocation list but can't know if a keybox is banned, so sometimes false positives can happen."
             "\n\nI have also created a ban list of known keyboxes here: https://raw.githubusercontent.com/daboynb/autojson/refs/heads/main/banned.txt"
             "\nThanks to @antezero, it is almost always up to date, but this method can still fail because it is based on community reports."
-            
+
         )
     else:
-        if has_leaked_serial and not has_banned_serial:
+        if has_leaked_serial and not has_banned_serial and is_not_revoked:
             reply += "\n🟡 Since this keybox was in a leak it can be soft banned and if yes you will get only device integrity"
         else:
             reply += "\n🔴 This key box *can't be used* for strong integrity"
