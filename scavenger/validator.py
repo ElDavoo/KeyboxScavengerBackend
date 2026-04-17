@@ -5,7 +5,7 @@ import json
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Generic, TypeVar
 
@@ -66,6 +66,14 @@ class KeyboxValidator:
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
+
+    @staticmethod
+    def _not_valid_before(certificate: x509.Certificate) -> datetime:
+        return certificate.not_valid_before_utc
+
+    @staticmethod
+    def _not_valid_after(certificate: x509.Certificate) -> datetime:
+        return certificate.not_valid_after_utc
 
     async def validate(self, xml_payload: bytes) -> ValidationResult:
         reasons: list[str] = []
@@ -131,9 +139,9 @@ class KeyboxValidator:
             if subject_serial_number and subject_serial_number in banned_serials:
                 has_banned_serial = True
 
-            current_time = datetime.utcnow()
-            not_valid_before = certificate.not_valid_before
-            not_valid_after = certificate.not_valid_after
+            current_time = datetime.now(timezone.utc)
+            not_valid_before = self._not_valid_before(certificate)
+            not_valid_after = self._not_valid_after(certificate)
 
             if current_time > not_valid_after:
                 any_certificate_expired = True
@@ -166,7 +174,7 @@ class KeyboxValidator:
             certificate_type = "knox"
 
         is_within_validity = all(
-            cert.not_valid_before <= datetime.utcnow() <= cert.not_valid_after
+            self._not_valid_before(cert) <= datetime.now(timezone.utc) <= self._not_valid_after(cert)
             for cert in certificates
         )
         is_correct_root = certificate_type in {"hardware", "knox"}
