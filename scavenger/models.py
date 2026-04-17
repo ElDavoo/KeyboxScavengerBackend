@@ -21,6 +21,6 @@ class ValidationResult:
 @dataclass
 class StorageResult:
     digest: str
-    sha_path: Path
+    digest_path: Path
     latest_path: Path
-    wrote_sha_file: bool
+    wrote_digest_file: bool

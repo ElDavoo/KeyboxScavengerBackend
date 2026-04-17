@@ -8,7 +8,7 @@ Telegram userbot that watches selected groups/channels for XML keyboxes, validat
 - Accepts XML documents and validates them with the same keybox checks used in this project.
 - Normalizes XML before validation/storage (removes comments, standard formatting) to avoid duplicate files caused only by formatting differences.
 - Stores valid files in a dedicated folder:
-  - `<sha256>.xml` (content-addressed)
+  - `<md5>.xml` (content-addressed)
   - `keybox.xml` (latest valid snapshot)
 
 ## Prerequisites
@@ -134,7 +134,7 @@ docker compose up -d
 
 Inside container:
 
-- `/app/data/keyboxes/<sha256>.xml`
+- `/app/data/keyboxes/<md5>.xml`
 - `/app/data/keyboxes/keybox.xml`
 
 Compose persists these in the `keybox_data` volume.
