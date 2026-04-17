@@ -19,8 +19,8 @@ RUN pdm config python.use_venv false \
 
 COPY . /app
 
-RUN groupadd --system --gid 10001 appuser \
-	&& useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/appuser --shell /usr/sbin/nologin appuser \
+RUN groupadd --gid 1000 appuser \
+	&& useradd --uid 1000 --gid 1000 --create-home --home-dir /home/appuser --shell /usr/sbin/nologin appuser \
 	&& mkdir -p /app/data/keyboxes /app/data/session /app/logs \
 	&& chown -R appuser:appuser /app \
 	&& chmod 750 /app/data /app/data/keyboxes /app/data/session /app/logs
