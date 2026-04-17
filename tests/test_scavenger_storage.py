@@ -19,15 +19,18 @@ class KeyboxStorageTests(unittest.TestCase):
             second = storage.persist(payload_one)
             third = storage.persist(payload_two)
 
-            self.assertTrue(first.sha_path.exists())
-            self.assertTrue(second.sha_path.exists())
-            self.assertEqual(first.sha_path, second.sha_path)
-            self.assertTrue(first.wrote_sha_file)
-            self.assertFalse(second.wrote_sha_file)
+            self.assertTrue(first.digest_path.exists())
+            self.assertTrue(second.digest_path.exists())
+            self.assertEqual(first.digest_path, second.digest_path)
+            self.assertTrue(first.wrote_digest_file)
+            self.assertFalse(second.wrote_digest_file)
 
-            self.assertTrue(third.sha_path.exists())
-            self.assertNotEqual(first.sha_path, third.sha_path)
+            self.assertTrue(third.digest_path.exists())
+            self.assertNotEqual(first.digest_path, third.digest_path)
             self.assertEqual((output_dir / "keybox.xml").read_bytes(), payload_two)
+
+            self.assertEqual(first.digest_path.name, "8cfa2d5f761d67833f85d8d56571c319.xml")
+            self.assertEqual(third.digest_path.name, "b5b96db27bb53f9ba9e6f944c1144b94.xml")
 
     def test_normalized_xml_avoids_duplicates_from_formatting(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -56,9 +59,9 @@ class KeyboxStorageTests(unittest.TestCase):
             first = storage.persist(first_normalized)
             second = storage.persist(second_normalized)
 
-            self.assertEqual(first.sha_path, second.sha_path)
-            self.assertTrue(first.wrote_sha_file)
-            self.assertFalse(second.wrote_sha_file)
+            self.assertEqual(first.digest_path, second.digest_path)
+            self.assertTrue(first.wrote_digest_file)
+            self.assertFalse(second.wrote_digest_file)
 
 
 if __name__ == "__main__":

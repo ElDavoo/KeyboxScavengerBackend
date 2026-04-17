@@ -167,10 +167,10 @@ class KeyboxScavengerUserbot:
         storage_result = self.storage.persist(normalized_xml_payload)
         self.stats.valid += 1
         logger.info(
-            "Stored valid keybox chat={} message={} sha={} new={} latest={}",
+            "Stored valid keybox chat={} message={} digest={} new={} latest={}",
             event.chat_id,
             message.id,
             storage_result.digest,
-            storage_result.wrote_sha_file,
+            storage_result.wrote_digest_file,
             storage_result.latest_path,
         )
