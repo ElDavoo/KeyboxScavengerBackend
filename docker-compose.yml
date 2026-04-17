@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: keybox-scavenger:local
+    user: "1000:1000"
     environment:
       SCAVENGER_API_ID: ${SCAVENGER_API_ID:-}
       SCAVENGER_API_HASH: ${SCAVENGER_API_HASH:-}
