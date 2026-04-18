@@ -4,10 +4,14 @@
 # @Software: PyCharm
 
 import aiohttp
+import base64
+import binascii
 import json
+import re
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from loguru import logger
 from datetime import datetime
 from cryptography import x509
@@ -116,6 +120,78 @@ def parse_number_of_certificates(xml_file):
     else:
         raise Exception('No NumberOfCertificates found.')
 
+_PEM_BEGIN = "-----BEGIN CERTIFICATE-----"
+_PEM_END = "-----END CERTIFICATE-----"
+_B64_LINE = re.compile(r"^[A-Za-z0-9+/=]+$")
+_WS = re.compile(r"\s+")
+
+
+def sanitize_pem_certificate(raw):
+    """
+    Rebuilds a clean PEM block from certificate text that may contain stray
+    human-typed notes around (or in place of) the BEGIN/END markers. Picks
+    the longest contiguous run of base64-only lines so unrelated junk on
+    separate lines is discarded. Raises ``ValueError`` if nothing recoverable
+    remains.
+    """
+    if not raw:
+        raise ValueError("Empty certificate content")
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").strip()
+    begin_idx = text.find(_PEM_BEGIN)
+    if begin_idx != -1:
+        end_idx = text.find(_PEM_END, begin_idx + len(_PEM_BEGIN))
+        if end_idx != -1:
+            text = text[begin_idx + len(_PEM_BEGIN):end_idx]
+
+    runs = []
+    current = []
+    for line in text.splitlines():
+        stripped = _WS.sub("", line)
+        if not stripped:
+            # Blank line: ignore without breaking the run. Some generators
+            # inject empty lines inside the PEM body.
+            continue
+        if stripped.startswith("-----"):
+            if current:
+                runs.append(current)
+                current = []
+            continue
+        if _B64_LINE.fullmatch(stripped):
+            current.append(stripped)
+        elif current:
+            runs.append(current)
+            current = []
+    if current:
+        runs.append(current)
+    if not runs:
+        raise ValueError("Certificate contains no recoverable base64 data")
+
+    best = max(runs, key=lambda r: sum(len(s) for s in r))
+    if len(best) > 1:
+        # PEM body lines share a uniform width except for the last; drop
+        # anything that doesn't fit that shape (stray human-typed lines
+        # that happen to be all-base64 chars sit at irregular lengths).
+        modal_len, _ = Counter(len(s) for s in best).most_common(1)[0]
+        body = [s for s in best if len(s) == modal_len]
+        last_full = max(i for i, s in enumerate(best) if len(s) == modal_len)
+        if last_full + 1 < len(best) and len(best[last_full + 1]) < modal_len:
+            body.append(best[last_full + 1])
+        best = body
+
+    payload = "".join(best)
+    # Some generators emit PEM with non-zero padding bits in the last base64
+    # group. Python's stdlib decoder is lenient there; ``cryptography`` is
+    # strict. Round-trip via stdlib so the resulting PEM is strictly valid.
+    pad = (-len(payload)) % 4
+    try:
+        der = base64.b64decode(payload + "=" * pad, validate=False)
+    except binascii.Error as e:
+        raise ValueError(f"Certificate base64 payload is not decodable: {e}")
+    payload = base64.b64encode(der).decode("ascii")
+    wrapped = "\n".join(payload[i:i + 64] for i in range(0, len(payload), 64))
+    return f"{_PEM_BEGIN}\n{wrapped}\n{_PEM_END}\n"
+
+
 def parse_certificates(xml_file, pem_number):
     """
     Extracts PEM-formatted certificates from the XML file up to the specified number.
@@ -137,7 +213,7 @@ def parse_certificates(xml_file, pem_number):
     for keybox in root.findall('.//Keybox'):
         for key in keybox.findall('Key'):
             for certificate in key.findall('.//Certificate[@format="pem"]'):
-                pem_certificates.append(certificate.text.strip())
+                pem_certificates.append(sanitize_pem_certificate(certificate.text))
                 if len(pem_certificates) == pem_number:
                     break
             if len(pem_certificates) == pem_number:
