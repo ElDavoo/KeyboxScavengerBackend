@@ -1,6 +1,14 @@
 # Keybox Scavenger Backend
 
-Telegram userbot that watches selected groups/channels for XML keyboxes, validates them, and stores only valid ones.
+![Keybox Scavenger](https://repository-images.githubusercontent.com/1213838454/00fef3de-b7a0-4777-910a-2eb06326c3ab)
+
+This is the backend part of 
+[Keybox Scavenger](https://github.com/ElDavoo/KeyboxScavenger).  
+It automatically downloads keyboxes from Telegram.
+
+## Keybox repository
+
+Find keyboxes in https://www.davidepalma.it/pib/  
 
 ## What It Does
 
