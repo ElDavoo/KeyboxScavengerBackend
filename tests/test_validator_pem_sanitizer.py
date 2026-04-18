@@ -89,6 +89,67 @@ suffix</Certificate>
             "-----BEGIN CERTIFICATE-----\nQQ==\n-----END CERTIFICATE-----\n",
         )
 
+    def test_parse_certificates_handles_comment_noise_in_keybox_payload(self):
+        root = ET.fromstring(
+            """
+<AndroidAttestation>
+    <NumberOfKeyboxes>1</NumberOfKeyboxes>
+    <Keybox DeviceID="t.me/keyboxstrong @evokerr">
+        <Key algorithm="ecdsa">
+            <PrivateKey format="pem">
+-----BEGIN EC PRIVATE KEY-----
+MDEyMzQ1Njc4OWFiY2RlZg==
+-----END EC PRIVATE KEY-----
+            </PrivateKey>
+            <CertificateChain>
+                <NumberOfCertificates>3</NumberOfCertificates>
+                <Certificate format="pem">
+-----BEGIN CERTIFICATE-----
+QUFB
+<!--comment noise-->
+QkJC
+-----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+-----BEGIN CERTIFICATE-----
+Q0ND
+<!--another comment-->
+RERE
+-----END CERTIFICATE-----
+                </Certificate>
+                <Certificate format="pem">
+-----BEGIN CERTIFICATE-----
+RUVG
+<!--comment noise-->
+R0dH
+-----END CERTIFICATE-----
+                </Certificate>
+            </CertificateChain>
+        </Key>
+    </Keybox>
+</AndroidAttestation>
+"""
+        )
+
+        counts = KeyboxValidator._parse_number_of_certificates(root)
+        self.assertEqual(max(counts), 3)
+
+        certificates = KeyboxValidator._parse_certificates(root, 3)
+
+        self.assertEqual(len(certificates), 3)
+        self.assertEqual(
+            certificates[0],
+            "-----BEGIN CERTIFICATE-----\nQUFBQkJC\n-----END CERTIFICATE-----\n",
+        )
+        self.assertEqual(
+            certificates[1],
+            "-----BEGIN CERTIFICATE-----\nQ0NDRERE\n-----END CERTIFICATE-----\n",
+        )
+        self.assertEqual(
+            certificates[2],
+            "-----BEGIN CERTIFICATE-----\nRUVGR0dH\n-----END CERTIFICATE-----\n",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
