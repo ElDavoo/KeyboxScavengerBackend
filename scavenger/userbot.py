@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 from loguru import logger
 from telethon import TelegramClient, events
@@ -35,6 +37,7 @@ class KeyboxScavengerUserbot:
         self.validator = validator
         self.storage = storage
         self.stats = ScanStats()
+        self._revocation_maintenance_lock = asyncio.Lock()
 
     async def run(self) -> None:
         session = (
@@ -165,6 +168,8 @@ class KeyboxScavengerUserbot:
             )
             return
 
+        await self._maybe_handle_revocation_update()
+
         if not result.is_valid:
             self.stats.invalid += 1
             logger.info(
@@ -185,3 +190,95 @@ class KeyboxScavengerUserbot:
             storage_result.wrote_digest_file,
             storage_result.latest_path,
         )
+
+    async def _maybe_handle_revocation_update(self) -> None:
+        if not self.validator.consume_revocation_update_flag():
+            return
+
+        async with self._revocation_maintenance_lock:
+            moved_count, replaced_latest = await self._quarantine_revoked_keyboxes()
+            logger.info(
+                "Revocation update maintenance complete moved_revoked={} replaced_latest={}",
+                moved_count,
+                replaced_latest,
+            )
+
+    async def _quarantine_revoked_keyboxes(self) -> tuple[int, bool]:
+        output_dir = self.storage.output_dir
+        revoked_dir = output_dir / "revoked"
+        revoked_dir.mkdir(parents=True, exist_ok=True)
+
+        candidate_payloads: list[tuple[float, bytes]] = []
+        moved_count = 0
+
+        for keybox_path in self._repository_keyboxes(output_dir):
+            try:
+                payload = keybox_path.read_bytes()
+            except OSError as exc:
+                logger.warning("Failed to read keybox {}: {}", keybox_path, exc)
+                continue
+
+            try:
+                result = await self.validator.validate(payload)
+            except Exception as exc:
+                logger.warning("Failed to validate keybox {}: {}", keybox_path, exc)
+                continue
+
+            if result.revoked_serials:
+                destination = self._next_revoked_destination(revoked_dir, keybox_path)
+                keybox_path.replace(destination)
+                moved_count += 1
+                logger.warning("Moved revoked keybox {} to {}", keybox_path, destination)
+                continue
+
+            if result.is_valid:
+                candidate_payloads.append((keybox_path.stat().st_mtime, payload))
+
+        latest_path = output_dir / "keybox.xml"
+        replaced_latest = False
+        if latest_path.exists():
+            try:
+                latest_payload = latest_path.read_bytes()
+                latest_result = await self.validator.validate(latest_payload)
+            except Exception as exc:
+                logger.warning("Failed to validate latest keybox {}: {}", latest_path, exc)
+            else:
+                if latest_result.revoked_serials:
+                    replacement_payload = self._select_replacement_payload(candidate_payloads)
+                    if replacement_payload is not None:
+                        self.storage.persist(replacement_payload)
+                        replaced_latest = True
+
+        return moved_count, replaced_latest
+
+    @staticmethod
+    def _repository_keyboxes(output_dir: Path) -> list[Path]:
+        return sorted(
+            [
+                path
+                for path in output_dir.glob("*.xml")
+                if path.is_file() and path.name != "keybox.xml"
+            ]
+        )
+
+    @staticmethod
+    def _next_revoked_destination(revoked_dir: Path, source_path: Path) -> Path:
+        destination = revoked_dir / source_path.name
+        if not destination.exists():
+            return destination
+
+        stem = source_path.stem
+        suffix = source_path.suffix
+        index = 1
+        while True:
+            candidate = revoked_dir / f"{stem}.{index}{suffix}"
+            if not candidate.exists():
+                return candidate
+            index += 1
+
+    @staticmethod
+    def _select_replacement_payload(candidate_payloads: list[tuple[float, bytes]]) -> bytes | None:
+        if not candidate_payloads:
+            return None
+        candidate_payloads.sort(key=lambda item: item[0], reverse=True)
+        return candidate_payloads[0][1]

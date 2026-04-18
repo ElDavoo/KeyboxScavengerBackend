@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import xml.etree.ElementTree as ET
@@ -44,11 +45,33 @@ class KeyboxValidator:
         self._timeout = aiohttp.ClientTimeout(total=settings.request_timeout_seconds)
         self._banned_cache: RemoteCache[list[str]] | None = None
         self._revocation_cache: RemoteCache[dict] | None = None
+        self._revocation_entries_fingerprint: str | None = None
+        self._revocation_updated_since_last_check = False
 
         self._google_public_key = self._load_public_key(ROOT_GOOGLE_PEM_PATH)
         self._aosp_ec_public_key = self._load_public_key(ROOT_AOSP_EC_PEM_PATH)
         self._aosp_rsa_public_key = self._load_public_key(ROOT_AOSP_RSA_PEM_PATH)
         self._knox_public_key = self._load_public_key(ROOT_KNOX_PEM_PATH)
+
+    def consume_revocation_update_flag(self) -> bool:
+        if not self._revocation_updated_since_last_check:
+            return False
+
+        self._revocation_updated_since_last_check = False
+        return True
+
+    @staticmethod
+    def _revocation_fingerprint(status_json: dict) -> str:
+        entries = status_json.get("entries", {})
+        canonical_entries = json.dumps(entries, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(canonical_entries.encode("utf-8")).hexdigest()
+
+    def _update_revocation_fingerprint(self, status_json: dict) -> None:
+        new_fingerprint = self._revocation_fingerprint(status_json)
+        old_fingerprint = self._revocation_entries_fingerprint
+        if old_fingerprint is not None and new_fingerprint != old_fingerprint:
+            self._revocation_updated_since_last_check = True
+        self._revocation_entries_fingerprint = new_fingerprint
 
     def _load_public_key(self, file_path: Path):
         with open(file_path, "rb") as key_file:
@@ -233,6 +256,7 @@ class KeyboxValidator:
         cache = self._revocation_cache
         now = time.time()
         if cache and (now - cache.fetched_at) < self.settings.cache_ttl_seconds:
+            self._update_revocation_fingerprint(cache.data)
             return cache.data
 
         if cache:
@@ -242,6 +266,7 @@ class KeyboxValidator:
             )
             if is_unchanged:
                 cache.fetched_at = now
+                self._update_revocation_fingerprint(cache.data)
                 return cache.data
 
         headers = {
@@ -263,6 +288,8 @@ class KeyboxValidator:
 
         if "entries" not in status_json or not isinstance(status_json["entries"], dict):
             raise ValueError("Invalid revocation status payload")
+
+        self._update_revocation_fingerprint(status_json)
 
         self._revocation_cache = RemoteCache(
             fetched_at=now,

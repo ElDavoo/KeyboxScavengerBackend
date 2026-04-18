@@ -102,6 +102,44 @@ class ValidatorRemoteCacheTests(unittest.IsolatedAsyncioTestCase):
         validator._request_head_metadata.assert_awaited_once()
         validator._request_json.assert_awaited_once()
 
+    async def test_revocation_update_flag_is_set_when_entries_change(self):
+        validator = KeyboxValidator(self._build_settings())
+        validator._request_json = AsyncMock(
+            return_value=({"entries": {"old": {"reason": "first"}}}, "rev-1", None)
+        )
+
+        await validator._load_revocation_status()
+        self.assertFalse(validator.consume_revocation_update_flag())
+
+        validator._request_head_metadata = AsyncMock(return_value=("rev-2", None))
+        validator._request_json = AsyncMock(
+            return_value=({"entries": {"new": {"reason": "second"}}}, "rev-2", None)
+        )
+
+        await validator._load_revocation_status()
+
+        self.assertTrue(validator.consume_revocation_update_flag())
+        self.assertFalse(validator.consume_revocation_update_flag())
+
+    async def test_revocation_update_flag_stays_false_when_entries_unchanged(self):
+        validator = KeyboxValidator(self._build_settings())
+        initial_entries = {"same": {"reason": "value"}}
+        validator._request_json = AsyncMock(
+            return_value=({"entries": initial_entries}, "rev-1", None)
+        )
+
+        await validator._load_revocation_status()
+        self.assertFalse(validator.consume_revocation_update_flag())
+
+        validator._request_head_metadata = AsyncMock(return_value=("rev-2", None))
+        validator._request_json = AsyncMock(
+            return_value=({"entries": initial_entries}, "rev-2", None)
+        )
+
+        await validator._load_revocation_status()
+
+        self.assertFalse(validator.consume_revocation_update_flag())
+
 
 if __name__ == "__main__":
     unittest.main()
