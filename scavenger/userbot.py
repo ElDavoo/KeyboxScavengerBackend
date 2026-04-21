@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 from loguru import logger
 from telethon import TelegramClient, events
@@ -180,6 +181,22 @@ class KeyboxScavengerUserbot:
             )
             return
 
+        should_skip, subset_paths = self._classify_repository_overlap(normalized_xml_payload)
+        if should_skip:
+            logger.info(
+                "Skipped keybox already included chat={} message={}",
+                event.chat_id,
+                message.id,
+            )
+            return
+
+        for subset_path in subset_paths:
+            try:
+                subset_path.unlink()
+                logger.info("Removed subset keybox {}", subset_path)
+            except OSError as exc:
+                logger.warning("Failed removing subset keybox {}: {}", subset_path, exc)
+
         storage_result = self.storage.persist(normalized_xml_payload)
         self.stats.valid += 1
         logger.info(
@@ -260,6 +277,57 @@ class KeyboxScavengerUserbot:
                 if path.is_file() and path.name != "keybox.xml"
             ]
         )
+
+    def _classify_repository_overlap(self, incoming_payload: bytes) -> tuple[bool, list[Path]]:
+        incoming_signatures = self._extract_key_signatures(incoming_payload)
+        if not incoming_signatures:
+            return False, []
+
+        existing: list[tuple[Path, set[tuple[str, tuple[str, ...]]]]] = []
+        for path in self._repository_keyboxes(self.storage.output_dir):
+            try:
+                signatures = self._extract_key_signatures(path.read_bytes())
+            except OSError as exc:
+                logger.warning("Failed reading keybox {}: {}", path, exc)
+                continue
+
+            if signatures:
+                existing.append((path, signatures))
+
+        for _, signatures in existing:
+            if incoming_signatures <= signatures:
+                return True, []
+
+        subset_paths = [
+            path for path, signatures in existing if signatures < incoming_signatures
+        ]
+        return False, subset_paths
+
+    @staticmethod
+    def _extract_key_signatures(payload: bytes) -> set[tuple[str, tuple[str, ...]]]:
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError as exc:
+            logger.warning("Failed to parse keybox XML for overlap detection: {}", exc)
+            return set()
+
+        signatures: set[tuple[str, tuple[str, ...]]] = set()
+        for keybox in root.findall(".//Keybox"):
+            for key in keybox.findall("Key"):
+                algorithm = (key.get("algorithm") or "").strip().lower()
+                certificate_chain = tuple(
+                    KeyboxScavengerUserbot._normalize_key_material(certificate.text)
+                    for certificate in key.findall('.//Certificate[@format="pem"]')
+                    if certificate.text
+                )
+                if certificate_chain:
+                    signatures.add((algorithm, certificate_chain))
+
+        return signatures
+
+    @staticmethod
+    def _normalize_key_material(raw_text: str) -> str:
+        return "\n".join(line.strip() for line in raw_text.splitlines() if line.strip())
 
     @staticmethod
     def _next_revoked_destination(revoked_dir: Path, source_path: Path) -> Path:
