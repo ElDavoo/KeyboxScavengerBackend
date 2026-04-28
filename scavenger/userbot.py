@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -39,6 +40,7 @@ class KeyboxScavengerUserbot:
         self.storage = storage
         self.stats = ScanStats()
         self._revocation_maintenance_lock = asyncio.Lock()
+        self._revocation_refresh_stop = asyncio.Event()
 
     async def run(self) -> None:
         session = (
@@ -71,7 +73,15 @@ class KeyboxScavengerUserbot:
 
         self._register_handlers(client, targets)
 
-        await client.run_until_disconnected()
+        self._revocation_refresh_stop.clear()
+        refresh_task = asyncio.create_task(self._periodic_revocation_refresh())
+        try:
+            await client.run_until_disconnected()
+        finally:
+            self._revocation_refresh_stop.set()
+            refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await refresh_task
 
     def _register_handlers(self, client: TelegramClient, targets: list) -> None:
         @client.on(events.NewMessage(chats=targets))
@@ -220,6 +230,20 @@ class KeyboxScavengerUserbot:
                 moved_count,
                 replaced_latest,
             )
+
+    async def _periodic_revocation_refresh(self) -> None:
+        interval = self.settings.revocation_refresh_seconds
+        while not self._revocation_refresh_stop.is_set():
+            try:
+                await self.validator.refresh_revocation_status()
+                await self._maybe_handle_revocation_update()
+            except Exception as exc:
+                logger.warning("Periodic revocation refresh failed: {}", exc)
+
+            try:
+                await asyncio.wait_for(self._revocation_refresh_stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
 
     async def _run_startup_revocation_maintenance(self) -> None:
         async with self._revocation_maintenance_lock:
