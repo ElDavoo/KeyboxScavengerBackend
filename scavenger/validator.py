@@ -69,6 +69,9 @@ class KeyboxValidator:
         self._revocation_updated_since_last_check = False
         return True
 
+    async def refresh_revocation_status(self) -> None:
+        await self._load_revocation_status()
+
     @staticmethod
     def _revocation_fingerprint(status_json: dict) -> str:
         entries = status_json.get("entries", {})
