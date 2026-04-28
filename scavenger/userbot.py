@@ -66,6 +66,7 @@ class KeyboxScavengerUserbot:
         if not targets:
             raise RuntimeError("No target chats resolved from SCAVENGER_TARGETS")
 
+        await self._run_startup_revocation_maintenance()
         logger.info("Watching {} targets", len(targets))
 
         self._register_handlers(client, targets)
@@ -219,6 +220,23 @@ class KeyboxScavengerUserbot:
                 moved_count,
                 replaced_latest,
             )
+
+    async def _run_startup_revocation_maintenance(self) -> None:
+        async with self._revocation_maintenance_lock:
+            try:
+                moved_count, replaced_latest = await self._quarantine_revoked_keyboxes()
+            except Exception as exc:
+                logger.warning("Startup revocation maintenance failed: {}", exc)
+                return
+
+            if moved_count or replaced_latest:
+                logger.info(
+                    "Startup revocation maintenance complete moved_revoked={} replaced_latest={}",
+                    moved_count,
+                    replaced_latest,
+                )
+            else:
+                logger.info("Startup revocation maintenance complete with no changes")
 
     async def _quarantine_revoked_keyboxes(self) -> tuple[int, bool]:
         output_dir = self.storage.output_dir

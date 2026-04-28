@@ -229,6 +229,17 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
 
         userbot._quarantine_revoked_keyboxes.assert_not_called()
 
+    def test_startup_revocation_maintenance_runs_quarantine(self):
+        validator = Mock()
+        validator.consume_revocation_update_flag = Mock(return_value=False)
+
+        userbot = KeyboxScavengerUserbot(settings=Mock(), validator=validator, storage=Mock())
+        userbot._quarantine_revoked_keyboxes = AsyncMock(return_value=(0, False))
+
+        asyncio.run(userbot._run_startup_revocation_maintenance())
+
+        userbot._quarantine_revoked_keyboxes.assert_awaited_once()
+
     def test_superset_removes_existing_subset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
