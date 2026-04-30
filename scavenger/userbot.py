@@ -7,8 +7,9 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 from loguru import logger
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, utils
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel
 
 from scavenger.config import ScavengerSettings
 from scavenger.storage import KeyboxStorage
@@ -28,6 +29,13 @@ class ScanStats:
     errors: int = 0
 
 
+@dataclass
+class PollTarget:
+    entity: object
+    label: str
+    peer_id: int
+
+
 class KeyboxScavengerUserbot:
     def __init__(
         self,
@@ -41,6 +49,7 @@ class KeyboxScavengerUserbot:
         self.stats = ScanStats()
         self._revocation_maintenance_lock = asyncio.Lock()
         self._revocation_refresh_stop = asyncio.Event()
+        self._polling_stop = asyncio.Event()
 
     async def run(self) -> None:
         session = (
@@ -64,7 +73,7 @@ class KeyboxScavengerUserbot:
                 "The Telegram session is not authorized. Set SCAVENGER_SESSION_STRING or use an authorized session file."
             )
 
-        targets = await self._resolve_targets(client)
+        targets, poll_targets = await self._resolve_targets(client)
         if not targets:
             raise RuntimeError("No target chats resolved from SCAVENGER_TARGETS")
 
@@ -73,15 +82,34 @@ class KeyboxScavengerUserbot:
 
         self._register_handlers(client, targets)
 
+        polling_task = None
+        if poll_targets and self.settings.unsubscribed_poll_seconds > 0:
+            logger.info(
+                "Polling {} non-subscribed targets every {}s",
+                len(poll_targets),
+                self.settings.unsubscribed_poll_seconds,
+            )
+            self._polling_stop.clear()
+            polling_task = asyncio.create_task(
+                self._poll_unsubscribed_targets(client, poll_targets)
+            )
+        elif poll_targets:
+            logger.info("Polling disabled for {} non-subscribed targets", len(poll_targets))
+
         self._revocation_refresh_stop.clear()
         refresh_task = asyncio.create_task(self._periodic_revocation_refresh())
         try:
             await client.run_until_disconnected()
         finally:
+            self._polling_stop.set()
             self._revocation_refresh_stop.set()
             refresh_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await refresh_task
+            if polling_task is not None:
+                polling_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await polling_task
 
     def _register_handlers(self, client: TelegramClient, targets: list) -> None:
         @client.on(events.NewMessage(chats=targets))
@@ -96,20 +124,49 @@ class KeyboxScavengerUserbot:
         self._on_new_message = on_new_message
         self._on_edited_message = on_edited_message
 
-    async def _resolve_targets(self, client: TelegramClient) -> list:
+    async def _resolve_targets(self, client: TelegramClient) -> tuple[list, list[PollTarget]]:
         resolved = []
+        poll_targets: list[PollTarget] = []
         for target in self.settings.monitored_targets:
             try:
-                resolved_target = await client.get_input_entity(target)
-                resolved.append(resolved_target)
-                logger.info("Resolved target {}", target)
+                entity = await client.get_entity(target)
+                resolved.append(entity)
+                label = self._format_target_label(target, entity)
+                if self._requires_polling(entity):
+                    poll_targets.append(
+                        PollTarget(
+                            entity=entity,
+                            label=label,
+                            peer_id=utils.get_peer_id(entity),
+                        )
+                    )
+                    logger.info("Resolved target {} (polling enabled)", label)
+                else:
+                    logger.info("Resolved target {}", label)
             except Exception as exc:
                 self.stats.errors += 1
                 logger.error("Failed to resolve target {}: {}", target, exc)
-        return resolved
+        return resolved, poll_targets
+
+    @staticmethod
+    def _requires_polling(entity: object) -> bool:
+        return isinstance(entity, Channel) and bool(entity.left)
+
+    @staticmethod
+    def _format_target_label(target: object, entity: object) -> str:
+        title = getattr(entity, "title", None)
+        if title:
+            return str(title)
+        username = getattr(entity, "username", None)
+        if username:
+            return f"@{username}"
+        return str(target)
 
     async def _handle_message(self, event) -> None:
-        message = event.message
+        await self._handle_message_payload(event.client, event.message, event.chat_id)
+
+    async def _handle_message_payload(self, client: TelegramClient, message, chat_id: int | None) -> None:
+        resolved_chat_id = chat_id if chat_id is not None else getattr(message, "chat_id", None)
         file_info = message.file
         if file_info is None:
             return
@@ -127,19 +184,19 @@ class KeyboxScavengerUserbot:
             self.stats.skipped_oversized += 1
             logger.warning(
                 "Skipping oversized XML chat={} message={} size={}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
                 file_size,
             )
             return
 
         try:
-            payload = await event.client.download_media(message, bytes)
+            payload = await client.download_media(message, bytes)
         except Exception as exc:
             self.stats.errors += 1
             logger.error(
                 "Failed to download document chat={} message={}: {}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
                 exc,
             )
@@ -149,7 +206,7 @@ class KeyboxScavengerUserbot:
             self.stats.errors += 1
             logger.error(
                 "Download returned no payload chat={} message={}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
             )
             return
@@ -160,7 +217,7 @@ class KeyboxScavengerUserbot:
         except XmlNormalizationError as exc:
             logger.warning(
                 "Skipping XML normalization chat={} message={} reason={}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
                 exc,
             )
@@ -174,7 +231,7 @@ class KeyboxScavengerUserbot:
             self.stats.errors += 1
             logger.error(
                 "Validation failed chat={} message={}: {}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
                 exc,
             )
@@ -186,7 +243,7 @@ class KeyboxScavengerUserbot:
             self.stats.invalid += 1
             logger.info(
                 "Rejected keybox chat={} message={} reasons={}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
                 "; ".join(result.reasons) if result.reasons else "unknown",
             )
@@ -196,7 +253,7 @@ class KeyboxScavengerUserbot:
         if should_skip:
             logger.info(
                 "Skipped keybox already included chat={} message={}",
-                event.chat_id,
+                resolved_chat_id,
                 message.id,
             )
             return
@@ -212,12 +269,65 @@ class KeyboxScavengerUserbot:
         self.stats.valid += 1
         logger.info(
             "Stored valid keybox chat={} message={} digest={} new={} latest={}",
-            event.chat_id,
+            resolved_chat_id,
             message.id,
             storage_result.digest,
             storage_result.wrote_digest_file,
             storage_result.latest_path,
         )
+
+    async def _poll_unsubscribed_targets(
+        self,
+        client: TelegramClient,
+        targets: list[PollTarget],
+    ) -> None:
+        interval = self.settings.unsubscribed_poll_seconds
+        last_seen: dict[int, int | None] = {}
+        for target in targets:
+            last_seen[target.peer_id] = await self._prime_last_seen(client, target)
+
+        while not self._polling_stop.is_set():
+            for target in targets:
+                cursor = last_seen.get(target.peer_id)
+                if cursor is None:
+                    last_seen[target.peer_id] = await self._prime_last_seen(client, target)
+                    continue
+
+                try:
+                    cursor_value = cursor
+                    async for message in client.iter_messages(
+                        target.entity,
+                        min_id=cursor,
+                        reverse=True,
+                    ):
+                        if message.id is None or message.id <= cursor_value:
+                            continue
+                        last_seen[target.peer_id] = max(last_seen[target.peer_id] or 0, message.id)
+                        await self._handle_message_payload(
+                            client,
+                            message,
+                            getattr(message, "chat_id", None) or target.peer_id,
+                        )
+                except Exception as exc:
+                    logger.warning("Polling failed for {}: {}", target.label, exc)
+
+            try:
+                await asyncio.wait_for(self._polling_stop.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _prime_last_seen(
+        self,
+        client: TelegramClient,
+        target: PollTarget,
+    ) -> int | None:
+        try:
+            async for message in client.iter_messages(target.entity, limit=1):
+                if message.id is not None:
+                    return message.id
+        except Exception as exc:
+            logger.warning("Failed to prime polling cursor for {}: {}", target.label, exc)
+        return None
 
     async def _maybe_handle_revocation_update(self) -> None:
         if not self.validator.consume_revocation_update_flag():

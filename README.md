@@ -13,6 +13,7 @@ Find keyboxes in https://www.davidepalma.it/pib/
 ## What It Does
 
 - Monitors configured Telegram chats/channels (user account, not bot token).
+- Polls non-subscribed channels on a configurable interval to avoid delayed updates (`SCAVENGER_UNSUBSCRIBED_POLL_SECONDS`).
 - Accepts XML documents and validates them with the same keybox checks used in this project.
 - Normalizes XML before validation/storage (removes comments, standard formatting) to avoid duplicate files caused only by formatting differences.
 - Stores valid files in a dedicated folder:

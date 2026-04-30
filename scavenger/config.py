@@ -48,6 +48,10 @@ class ScavengerSettings(BaseSettings):
     )
     network_retries: int = Field(2, validation_alias="SCAVENGER_NETWORK_RETRIES")
     cache_ttl_seconds: int = Field(300, validation_alias="SCAVENGER_CACHE_TTL_SECONDS")
+    unsubscribed_poll_seconds: int = Field(
+        10 * 60,
+        validation_alias="SCAVENGER_UNSUBSCRIBED_POLL_SECONDS",
+    )
     log_level: str = Field("INFO", validation_alias="SCAVENGER_LOG_LEVEL")
     revocation_refresh_seconds: int = Field(
         6 * 60 * 60,
@@ -112,6 +116,13 @@ class ScavengerSettings(BaseSettings):
     def validate_network_retries(cls, value: int) -> int:
         if value < 0:
             raise ValueError("SCAVENGER_NETWORK_RETRIES must be >= 0")
+        return value
+
+    @field_validator("unsubscribed_poll_seconds")
+    @classmethod
+    def validate_unsubscribed_poll_seconds(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("SCAVENGER_UNSUBSCRIBED_POLL_SECONDS must be >= 0")
         return value
 
     @field_validator("revocation_refresh_seconds")

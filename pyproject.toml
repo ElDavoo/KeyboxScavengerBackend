@@ -19,7 +19,7 @@ dependencies = [
 
 requires-python = ">=3.14"
 readme = "README.md"
-license = { text = "AGPL-3.0" }
+license = { text = "AGPL-3.0 with Google use restriction" }
 
 
 [tool.ruff]
