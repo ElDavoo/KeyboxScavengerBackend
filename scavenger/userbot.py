@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import xml.etree.ElementTree as ET
@@ -358,6 +359,14 @@ class KeyboxScavengerUserbot:
     async def _run_startup_revocation_maintenance(self) -> None:
         async with self._revocation_maintenance_lock:
             try:
+                removed_count = self._deduplicate_repository()
+            except Exception as exc:
+                logger.warning("Startup repository deduplication failed: {}", exc)
+            else:
+                if removed_count:
+                    logger.info("Startup deduplication removed {} redundant keyboxes", removed_count)
+
+            try:
                 moved_count, replaced_latest = await self._quarantine_revoked_keyboxes()
             except Exception as exc:
                 logger.warning("Startup revocation maintenance failed: {}", exc)
@@ -430,12 +439,74 @@ class KeyboxScavengerUserbot:
             ]
         )
 
+    def _deduplicate_repository(self) -> int:
+        """Re-normalize stored keyboxes and drop the ones another stored keybox already covers.
+
+        Keyboxes stored by older versions may differ only in PEM wrapping or a tampered
+        algorithm label, which defeated both the digest file names and overlap detection.
+        """
+        output_dir = self.storage.output_dir
+        entries: dict[Path, tuple[float, set[tuple[str, ...]]]] = {}
+        removed_count = 0
+
+        for path in self._repository_keyboxes(output_dir):
+            if path in entries:
+                # Already produced by re-normalizing an earlier file.
+                continue
+
+            try:
+                payload = path.read_bytes()
+                mtime = path.stat().st_mtime
+                normalized = normalize_xml_payload(payload)
+            except (OSError, XmlNormalizationError) as exc:
+                logger.warning("Skipping keybox {} during deduplication: {}", path, exc)
+                continue
+
+            if normalized != payload:
+                _, normalized_path, wrote_digest_file = self.storage.persist_digest(normalized)
+                if normalized_path != path:
+                    path.unlink()
+                    logger.info("Re-normalized keybox {} as {}", path, normalized_path)
+                    if not wrote_digest_file:
+                        removed_count += 1
+                        mtime = max(mtime, normalized_path.stat().st_mtime)
+                    os.utime(normalized_path, (mtime, mtime))
+                    path = normalized_path
+
+            signatures = self._extract_key_signatures(normalized)
+            if signatures:
+                entries[path] = (mtime, signatures)
+
+        # Largest and newest first, so the keybox that survives is the most complete one.
+        ordered = sorted(entries.items(), key=lambda item: (len(item[1][1]), item[1][0]), reverse=True)
+        kept: list[set[tuple[str, ...]]] = []
+        for path, (_, signatures) in ordered:
+            if any(signatures <= kept_signatures for kept_signatures in kept):
+                path.unlink()
+                removed_count += 1
+                logger.info("Removed redundant keybox {}", path)
+                continue
+            kept.append(signatures)
+
+        latest_path = output_dir / "keybox.xml"
+        if latest_path.exists():
+            try:
+                latest_payload = latest_path.read_bytes()
+                normalized_latest = normalize_xml_payload(latest_payload)
+            except (OSError, XmlNormalizationError) as exc:
+                logger.warning("Failed to re-normalize latest keybox {}: {}", latest_path, exc)
+            else:
+                if normalized_latest != latest_payload:
+                    self.storage.write_latest(normalized_latest)
+
+        return removed_count
+
     def _classify_repository_overlap(self, incoming_payload: bytes) -> tuple[bool, list[Path]]:
         incoming_signatures = self._extract_key_signatures(incoming_payload)
         if not incoming_signatures:
             return False, []
 
-        existing: list[tuple[Path, set[tuple[str, tuple[str, ...]]]]] = []
+        existing: list[tuple[Path, set[tuple[str, ...]]]] = []
         for path in self._repository_keyboxes(self.storage.output_dir):
             try:
                 signatures = self._extract_key_signatures(path.read_bytes())
@@ -456,30 +527,36 @@ class KeyboxScavengerUserbot:
         return False, subset_paths
 
     @staticmethod
-    def _extract_key_signatures(payload: bytes) -> set[tuple[str, tuple[str, ...]]]:
+    def _extract_key_signatures(payload: bytes) -> set[tuple[str, ...]]:
         try:
             root = ET.fromstring(payload)
         except ET.ParseError as exc:
             logger.warning("Failed to parse keybox XML for overlap detection: {}", exc)
             return set()
 
-        signatures: set[tuple[str, tuple[str, ...]]] = set()
+        # A key is identified by its certificate chain alone: the algorithm label is
+        # derivable from the chain and is sometimes tampered with in reposted keyboxes.
+        signatures: set[tuple[str, ...]] = set()
         for keybox in root.findall(".//Keybox"):
             for key in keybox.findall("Key"):
-                algorithm = (key.get("algorithm") or "").strip().lower()
                 certificate_chain = tuple(
                     KeyboxScavengerUserbot._normalize_key_material(certificate.text)
                     for certificate in key.findall('.//Certificate[@format="pem"]')
                     if certificate.text
                 )
                 if certificate_chain:
-                    signatures.add((algorithm, certificate_chain))
+                    signatures.add(certificate_chain)
 
         return signatures
 
     @staticmethod
     def _normalize_key_material(raw_text: str) -> str:
-        return "\n".join(line.strip() for line in raw_text.splitlines() if line.strip())
+        # Compare only the PEM body so line wrapping cannot make identical material look distinct.
+        return "".join(
+            line.strip()
+            for line in raw_text.splitlines()
+            if line.strip() and not line.strip().startswith("-----")
+        )
 
     @staticmethod
     def _next_revoked_destination(revoked_dir: Path, source_path: Path) -> Path:

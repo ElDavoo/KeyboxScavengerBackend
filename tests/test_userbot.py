@@ -11,6 +11,7 @@ from scavenger.models import ValidationResult
 from scavenger.storage import KeyboxStorage
 from scavenger.userbot import KeyboxScavengerUserbot
 from scavenger.xml_normalizer import normalize_xml_payload
+from tests.keybox_factory import generate_key_pems, keybox_xml, unwrap_pem
 
 
 class FakeClient:
@@ -316,6 +317,74 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
             self.assertTrue(ecdsa_path.exists())
             self.assertEqual((output_dir / "keybox.xml").read_bytes(), ecdsa_payload)
             self.assertEqual(userbot.stats.valid, 1)
+
+    def test_reformatted_copy_of_stored_keybox_is_skipped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            ecdsa_pem, rsa_pem = generate_key_pems()
+
+            # Simulate a keybox stored before PEM bodies and algorithms were canonicalized.
+            legacy_path = output_dir / "legacy.xml"
+            legacy_path.write_bytes(keybox_xml(unwrap_pem(ecdsa_pem), unwrap_pem(rsa_pem)))
+            storage = KeyboxStorage(output_dir)
+
+            validator = Mock()
+            validator.validate = AsyncMock(return_value=ValidationResult(is_valid=True))
+            validator.consume_revocation_update_flag = Mock(return_value=False)
+
+            userbot = KeyboxScavengerUserbot(settings=Mock(max_xml_size=20 * 1024), validator=validator, storage=storage)
+
+            asyncio.run(userbot._handle_message(FakeEvent(keybox_xml(ecdsa_pem, rsa_pem, rsa_algorithm="@evokerr"))))
+
+            self.assertEqual(sorted(path.name for path in output_dir.glob("*.xml")), ["legacy.xml"])
+            self.assertEqual(userbot.stats.valid, 0)
+
+    def test_repository_deduplication_collapses_reformatted_copies(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            ecdsa_pem, rsa_pem = generate_key_pems()
+            other_ecdsa_pem, other_rsa_pem = generate_key_pems()
+
+            (output_dir / "single_line.xml").write_bytes(keybox_xml(unwrap_pem(ecdsa_pem), unwrap_pem(rsa_pem)))
+            (output_dir / "wrapped.xml").write_bytes(keybox_xml(ecdsa_pem, rsa_pem))
+            (output_dir / "tampered.xml").write_bytes(keybox_xml(ecdsa_pem, rsa_pem, rsa_algorithm="@evokerr"))
+            (output_dir / "unrelated.xml").write_bytes(keybox_xml(other_ecdsa_pem, other_rsa_pem))
+            (output_dir / "keybox.xml").write_bytes(keybox_xml(ecdsa_pem, rsa_pem, rsa_algorithm="@evokerr"))
+
+            storage = KeyboxStorage(output_dir)
+            userbot = KeyboxScavengerUserbot(settings=Mock(), validator=Mock(), storage=storage)
+
+            removed = userbot._deduplicate_repository()
+
+            canonical = normalize_xml_payload(keybox_xml(ecdsa_pem, rsa_pem))
+            other_canonical = normalize_xml_payload(keybox_xml(other_ecdsa_pem, other_rsa_pem))
+            self.assertEqual(removed, 2)
+            self.assertEqual(
+                sorted(path.name for path in output_dir.glob("*.xml")),
+                sorted(
+                    [
+                        "keybox.xml",
+                        f"{hashlib.md5(canonical).hexdigest()}.xml",
+                        f"{hashlib.md5(other_canonical).hexdigest()}.xml",
+                    ]
+                ),
+            )
+            self.assertEqual((output_dir / "keybox.xml").read_bytes(), canonical)
+
+    def test_startup_maintenance_deduplicates_before_quarantine(self):
+        userbot = KeyboxScavengerUserbot(settings=Mock(), validator=Mock(), storage=Mock())
+        calls = []
+        userbot._deduplicate_repository = Mock(side_effect=lambda: calls.append("dedup") or 0)
+
+        async def quarantine():
+            calls.append("quarantine")
+            return 0, False
+
+        userbot._quarantine_revoked_keyboxes = quarantine
+
+        asyncio.run(userbot._run_startup_revocation_maintenance())
+
+        self.assertEqual(calls, ["dedup", "quarantine"])
 
 
 if __name__ == "__main__":

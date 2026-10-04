@@ -14,14 +14,8 @@ class KeyboxStorage:
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def persist(self, xml_payload: bytes) -> StorageResult:
-        digest = hashlib.md5(xml_payload).hexdigest()
-        digest_path = self.output_dir / f"{digest}.xml"
+        digest, digest_path, wrote_digest_file = self.persist_digest(xml_payload)
         latest_path = self.output_dir / "keybox.xml"
-
-        wrote_digest_file = False
-        if not digest_path.exists():
-            self._atomic_write(digest_path, xml_payload)
-            wrote_digest_file = True
 
         # Always refresh the latest snapshot after storing a valid keybox.
         self._atomic_write(latest_path, xml_payload)
@@ -32,6 +26,21 @@ class KeyboxStorage:
             latest_path=latest_path,
             wrote_digest_file=wrote_digest_file,
         )
+
+    def persist_digest(self, xml_payload: bytes) -> tuple[str, Path, bool]:
+        """Store the payload under its digest name without touching keybox.xml."""
+        digest = hashlib.md5(xml_payload).hexdigest()
+        digest_path = self.output_dir / f"{digest}.xml"
+
+        wrote_digest_file = False
+        if not digest_path.exists():
+            self._atomic_write(digest_path, xml_payload)
+            wrote_digest_file = True
+
+        return digest, digest_path, wrote_digest_file
+
+    def write_latest(self, xml_payload: bytes) -> None:
+        self._atomic_write(self.output_dir / "keybox.xml", xml_payload)
 
     def _atomic_write(self, destination: Path, payload: bytes) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)
