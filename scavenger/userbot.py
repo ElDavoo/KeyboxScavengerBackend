@@ -290,12 +290,13 @@ class KeyboxScavengerUserbot:
             _, replaced_latest = await self._run_keybox_maintenance()
 
         logger.info(
-            "Stored valid keybox chat={} message={} digest={} new={} rkp={} replaced_latest={}",
+            "Stored valid keybox chat={} message={} digest={} new={} rkp={} banned={} replaced_latest={}",
             resolved_chat_id,
             message.id,
             digest,
             wrote_digest_file,
             result.is_rkp,
+            result.has_banned_serial,
             replaced_latest,
         )
 
@@ -439,6 +440,7 @@ class KeyboxScavengerUserbot:
         revoked_dir.mkdir(parents=True, exist_ok=True)
 
         candidates: list[KeyboxCandidate] = []
+        expirations: list[datetime] = []
         moved_count = 0
 
         for keybox_path in self._repository_keyboxes(output_dir):
@@ -466,7 +468,13 @@ class KeyboxScavengerUserbot:
                 )
                 continue
 
-            if result.is_valid:
+            if not result.is_valid:
+                continue
+
+            # Banned keyboxes stay in the repository (and still expire), but never become keybox.xml.
+            if result.nearest_expiration_date is not None:
+                expirations.append(result.nearest_expiration_date)
+            if not result.has_banned_serial:
                 candidates.append(
                     KeyboxCandidate(
                         payload=payload,
@@ -477,7 +485,6 @@ class KeyboxScavengerUserbot:
                     )
                 )
 
-        expirations = [candidate.expiration for candidate in candidates if candidate.expiration]
         self._next_expiration = min(expirations) if expirations else None
         self._expiration_schedule_changed.set()
 

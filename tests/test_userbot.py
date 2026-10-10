@@ -488,6 +488,42 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
             self.assertEqual((output_dir / "keybox.xml").read_bytes(), rkp_payload)
             self.assertEqual(userbot.stats.valid, 1)
 
+    def test_banned_keybox_is_stored_but_not_selected_as_latest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            storage = KeyboxStorage(output_dir)
+
+            allowed_payload = self._payload_ecdsa_only()
+            banned_payload = self._payload_rsa_only()
+            banned_expiration = datetime(2030, 1, 1, tzinfo=timezone.utc)
+            storage.persist(allowed_payload)
+
+            validator = Mock()
+
+            async def validate_payload(payload: bytes) -> ValidationResult:
+                if payload == banned_payload:
+                    # Banned and RKP: it would win the priority order if banned keyboxes were eligible.
+                    return ValidationResult(
+                        is_valid=True,
+                        is_rkp=True,
+                        has_banned_serial=True,
+                        nearest_expiration_date=banned_expiration,
+                    )
+                return ValidationResult(is_valid=True)
+
+            validator.validate = AsyncMock(side_effect=validate_payload)
+            validator.consume_revocation_update_flag = Mock(return_value=False)
+
+            userbot = KeyboxScavengerUserbot(settings=Mock(max_xml_size=20 * 1024), validator=validator, storage=storage)
+
+            asyncio.run(userbot._handle_message(FakeEvent(banned_payload)))
+
+            banned_path = output_dir / f"{hashlib.md5(banned_payload).hexdigest()}.xml"
+            self.assertTrue(banned_path.exists())
+            self.assertEqual((output_dir / "keybox.xml").read_bytes(), allowed_payload)
+            self.assertEqual(userbot.stats.valid, 1)
+            self.assertEqual(userbot._next_expiration, banned_expiration)
+
     def test_seconds_until_next_expiration(self):
         userbot = KeyboxScavengerUserbot(settings=Mock(), validator=Mock(), storage=Mock())
         self.assertIsNone(userbot._seconds_until_next_expiration())

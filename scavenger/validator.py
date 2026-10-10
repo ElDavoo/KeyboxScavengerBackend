@@ -219,18 +219,18 @@ class KeyboxValidator:
         )
         is_correct_root = certificate_type in {"hardware", "knox"}
         is_not_revoked = not revoked_certificates
-        is_not_banned = not has_banned_serial
         is_not_leaked = not has_leaked_serial
 
         special_serial_violation = self._has_special_serial_violation(certificates)
 
+        # Banned serials don't invalidate a keybox: it is still stored, just never
+        # selected as keybox.xml (see has_banned_serial).
         is_valid_keychain = (
             len(certificates) >= 3
             and is_within_validity
             and chain_is_valid
             and is_not_revoked
             and is_correct_root
-            and is_not_banned
             and is_not_leaked
             and not special_serial_violation
         )
@@ -250,8 +250,6 @@ class KeyboxValidator:
                 reasons.append("Unknown root certificate due to expiration of a certificate")
             else:
                 reasons.append("Unknown root certificate")
-        if has_banned_serial:
-            reasons.append("Banned serial detected")
         if has_leaked_serial:
             reasons.append("Leaked serial detected")
         if special_serial_violation:
