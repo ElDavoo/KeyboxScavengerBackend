@@ -39,8 +39,13 @@ class KeyboxStorage:
 
         return digest, digest_path, wrote_digest_file
 
-    def write_latest(self, xml_payload: bytes) -> None:
-        self._atomic_write(self.output_dir / "keybox.xml", xml_payload)
+    def write_latest(self, xml_payload: bytes) -> bool:
+        """Point keybox.xml at the given payload; returns False when it already matches."""
+        latest_path = self.output_dir / "keybox.xml"
+        if latest_path.exists() and latest_path.read_bytes() == xml_payload:
+            return False
+        self._atomic_write(latest_path, xml_payload)
+        return True
 
     def _atomic_write(self, destination: Path, payload: bytes) -> None:
         self.output_dir.mkdir(parents=True, exist_ok=True)

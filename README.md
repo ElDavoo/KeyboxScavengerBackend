@@ -18,7 +18,9 @@ Find keyboxes in https://www.davidepalma.it/pib/
 - Normalizes XML before validation/storage (removes comments, standard formatting) to avoid duplicate files caused only by formatting differences.
 - Stores valid files in a dedicated folder:
   - `<md5>.xml` (content-addressed)
-  - `keybox.xml` (latest valid snapshot)
+  - `keybox.xml` (best valid keybox: RKP first, then complete ECDSA + RSA ones, then the soonest expiration)
+- Accepts RKP keyboxes chaining to Google's newer "Key Attestation CA1" root.
+- Moves revoked and expired keyboxes to `revoked/`, re-checking exactly when the next stored keybox expires.
 
 ## Prerequisites
 

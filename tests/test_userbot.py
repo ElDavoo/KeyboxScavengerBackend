@@ -4,12 +4,13 @@ import asyncio
 import hashlib
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 from scavenger.models import ValidationResult
 from scavenger.storage import KeyboxStorage
-from scavenger.userbot import KeyboxScavengerUserbot
+from scavenger.userbot import KeyboxCandidate, KeyboxScavengerUserbot
 from scavenger.xml_normalizer import normalize_xml_payload
 from tests.keybox_factory import generate_key_pems, keybox_xml, unwrap_pem
 
@@ -174,7 +175,7 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
                 storage=storage,
             )
 
-            moved_count, replaced_latest = asyncio.run(userbot._quarantine_revoked_keyboxes())
+            moved_count, replaced_latest = asyncio.run(userbot._run_keybox_maintenance())
 
             self.assertEqual(moved_count, 1)
             self.assertTrue(replaced_latest)
@@ -213,7 +214,7 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
                 storage=storage,
             )
 
-            moved_count, replaced_latest = asyncio.run(userbot._quarantine_revoked_keyboxes())
+            moved_count, replaced_latest = asyncio.run(userbot._run_keybox_maintenance())
 
             self.assertEqual(moved_count, 1)
             self.assertFalse(replaced_latest)
@@ -224,22 +225,22 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
         validator.consume_revocation_update_flag = Mock(return_value=False)
 
         userbot = KeyboxScavengerUserbot(settings=Mock(), validator=validator, storage=Mock())
-        userbot._quarantine_revoked_keyboxes = AsyncMock(return_value=(0, False))
+        userbot._run_keybox_maintenance = AsyncMock(return_value=(0, False))
 
         asyncio.run(userbot._maybe_handle_revocation_update())
 
-        userbot._quarantine_revoked_keyboxes.assert_not_called()
+        userbot._run_keybox_maintenance.assert_not_called()
 
     def test_startup_revocation_maintenance_runs_quarantine(self):
         validator = Mock()
         validator.consume_revocation_update_flag = Mock(return_value=False)
 
         userbot = KeyboxScavengerUserbot(settings=Mock(), validator=validator, storage=Mock())
-        userbot._quarantine_revoked_keyboxes = AsyncMock(return_value=(0, False))
+        userbot._run_keybox_maintenance = AsyncMock(return_value=(0, False))
 
         asyncio.run(userbot._run_startup_revocation_maintenance())
 
-        userbot._quarantine_revoked_keyboxes.assert_awaited_once()
+        userbot._run_keybox_maintenance.assert_awaited_once()
 
     def test_superset_removes_existing_subset(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -380,11 +381,122 @@ class KeyboxScavengerUserbotTests(unittest.TestCase):
             calls.append("quarantine")
             return 0, False
 
-        userbot._quarantine_revoked_keyboxes = quarantine
+        userbot._run_keybox_maintenance = quarantine
 
         asyncio.run(userbot._run_startup_revocation_maintenance())
 
         self.assertEqual(calls, ["dedup", "quarantine"])
+
+    def test_select_latest_candidate_priority(self):
+        soon = datetime(2026, 10, 21, tzinfo=timezone.utc)
+        later = datetime(2032, 1, 1, tzinfo=timezone.utc)
+
+        def candidate(name: str, is_rkp: bool, is_complete: bool, expiration, mtime_ns: int = 0):
+            return KeyboxCandidate(
+                payload=name.encode(),
+                is_rkp=is_rkp,
+                is_complete=is_complete,
+                expiration=expiration,
+                mtime_ns=mtime_ns,
+            )
+
+        select = KeyboxScavengerUserbot._select_latest_candidate
+
+        rkp_incomplete = candidate("rkp-incomplete", True, False, later)
+        factory_complete = candidate("factory-complete", False, True, soon)
+        self.assertIs(select([factory_complete, rkp_incomplete]), rkp_incomplete)
+
+        complete_late = candidate("complete-late", False, True, later)
+        incomplete_soon = candidate("incomplete-soon", False, False, soon)
+        self.assertIs(select([incomplete_soon, complete_late]), complete_late)
+
+        complete_soon = candidate("complete-soon", False, True, soon)
+        self.assertIs(select([complete_late, complete_soon]), complete_soon)
+
+        older = candidate("older", False, True, later, mtime_ns=1)
+        newer = candidate("newer", False, True, later, mtime_ns=2)
+        self.assertIs(select([older, newer]), newer)
+
+        self.assertIsNone(select([]))
+
+    def test_is_complete_keybox_requires_ecdsa_and_rsa(self):
+        self.assertTrue(KeyboxScavengerUserbot._is_complete_keybox(self._payload_rsa_and_ecdsa()))
+        self.assertFalse(KeyboxScavengerUserbot._is_complete_keybox(self._payload_rsa_only()))
+        self.assertFalse(KeyboxScavengerUserbot._is_complete_keybox(self._payload_ecdsa_only()))
+
+    def test_maintenance_moves_expired_keybox_and_replaces_latest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            storage = KeyboxStorage(output_dir)
+
+            expired_payload = b"<keybox>expired</keybox>"
+            valid_payload = b"<keybox>valid</keybox>"
+            valid_expiration = datetime(2032, 1, 1, tzinfo=timezone.utc)
+
+            expired_path = output_dir / "expired-source.xml"
+            valid_path = output_dir / "valid-source.xml"
+            latest_path = output_dir / "keybox.xml"
+            expired_path.write_bytes(expired_payload)
+            valid_path.write_bytes(valid_payload)
+            latest_path.write_bytes(expired_payload)
+
+            validator = Mock()
+
+            async def validate_payload(payload: bytes) -> ValidationResult:
+                if payload == expired_payload:
+                    return ValidationResult(is_valid=False, has_expired_certificate=True)
+                if payload == valid_payload:
+                    return ValidationResult(is_valid=True, nearest_expiration_date=valid_expiration)
+                return ValidationResult(is_valid=False)
+
+            validator.validate = AsyncMock(side_effect=validate_payload)
+
+            userbot = KeyboxScavengerUserbot(settings=Mock(), validator=validator, storage=storage)
+
+            moved_count, replaced_latest = asyncio.run(userbot._run_keybox_maintenance())
+
+            self.assertEqual(moved_count, 1)
+            self.assertTrue(replaced_latest)
+            self.assertFalse(expired_path.exists())
+            self.assertTrue((output_dir / "revoked" / expired_path.name).exists())
+            self.assertEqual(latest_path.read_bytes(), valid_payload)
+            self.assertEqual(userbot._next_expiration, valid_expiration)
+
+    def test_new_non_rkp_keybox_does_not_replace_rkp_latest(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir)
+            storage = KeyboxStorage(output_dir)
+
+            rkp_payload = self._payload_ecdsa_only()
+            factory_payload = self._payload_rsa_and_ecdsa()
+            storage.persist(rkp_payload)
+
+            validator = Mock()
+
+            async def validate_payload(payload: bytes) -> ValidationResult:
+                return ValidationResult(is_valid=True, is_rkp=payload == rkp_payload)
+
+            validator.validate = AsyncMock(side_effect=validate_payload)
+            validator.consume_revocation_update_flag = Mock(return_value=False)
+
+            userbot = KeyboxScavengerUserbot(settings=Mock(max_xml_size=20 * 1024), validator=validator, storage=storage)
+
+            asyncio.run(userbot._handle_message(FakeEvent(factory_payload)))
+
+            factory_path = output_dir / f"{hashlib.md5(factory_payload).hexdigest()}.xml"
+            self.assertTrue(factory_path.exists())
+            self.assertEqual((output_dir / "keybox.xml").read_bytes(), rkp_payload)
+            self.assertEqual(userbot.stats.valid, 1)
+
+    def test_seconds_until_next_expiration(self):
+        userbot = KeyboxScavengerUserbot(settings=Mock(), validator=Mock(), storage=Mock())
+        self.assertIsNone(userbot._seconds_until_next_expiration())
+
+        userbot._next_expiration = datetime.now(timezone.utc) - timedelta(hours=1)
+        self.assertEqual(userbot._seconds_until_next_expiration(), 1)
+
+        userbot._next_expiration = datetime.now(timezone.utc) + timedelta(hours=1)
+        self.assertAlmostEqual(userbot._seconds_until_next_expiration(), 3601, delta=5)
 
 
 if __name__ == "__main__":

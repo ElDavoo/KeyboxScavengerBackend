@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -31,6 +32,15 @@ class ScanStats:
 
 
 @dataclass
+class KeyboxCandidate:
+    payload: bytes
+    is_rkp: bool
+    is_complete: bool
+    expiration: datetime | None
+    mtime_ns: int
+
+
+@dataclass
 class PollTarget:
     entity: object
     label: str
@@ -51,6 +61,9 @@ class KeyboxScavengerUserbot:
         self._revocation_maintenance_lock = asyncio.Lock()
         self._revocation_refresh_stop = asyncio.Event()
         self._polling_stop = asyncio.Event()
+        self._expiration_watch_stop = asyncio.Event()
+        self._expiration_schedule_changed = asyncio.Event()
+        self._next_expiration: datetime | None = None
 
     async def run(self) -> None:
         session = (
@@ -99,14 +112,18 @@ class KeyboxScavengerUserbot:
 
         self._revocation_refresh_stop.clear()
         refresh_task = asyncio.create_task(self._periodic_revocation_refresh())
+        self._expiration_watch_stop.clear()
+        expiration_task = asyncio.create_task(self._watch_expirations())
         try:
             await client.run_until_disconnected()
         finally:
             self._polling_stop.set()
             self._revocation_refresh_stop.set()
-            refresh_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await refresh_task
+            self._expiration_watch_stop.set()
+            for task in (refresh_task, expiration_task):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
             if polling_task is not None:
                 polling_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -266,15 +283,20 @@ class KeyboxScavengerUserbot:
             except OSError as exc:
                 logger.warning("Failed removing subset keybox {}: {}", subset_path, exc)
 
-        storage_result = self.storage.persist(normalized_xml_payload)
+        digest, _, wrote_digest_file = self.storage.persist_digest(normalized_xml_payload)
         self.stats.valid += 1
+
+        async with self._revocation_maintenance_lock:
+            _, replaced_latest = await self._run_keybox_maintenance()
+
         logger.info(
-            "Stored valid keybox chat={} message={} digest={} new={} latest={}",
+            "Stored valid keybox chat={} message={} digest={} new={} rkp={} replaced_latest={}",
             resolved_chat_id,
             message.id,
-            storage_result.digest,
-            storage_result.wrote_digest_file,
-            storage_result.latest_path,
+            digest,
+            wrote_digest_file,
+            result.is_rkp,
+            replaced_latest,
         )
 
     async def _poll_unsubscribed_targets(
@@ -335,7 +357,7 @@ class KeyboxScavengerUserbot:
             return
 
         async with self._revocation_maintenance_lock:
-            moved_count, replaced_latest = await self._quarantine_revoked_keyboxes()
+            moved_count, replaced_latest = await self._run_keybox_maintenance()
             logger.info(
                 "Revocation update maintenance complete moved_revoked={} replaced_latest={}",
                 moved_count,
@@ -367,7 +389,7 @@ class KeyboxScavengerUserbot:
                     logger.info("Startup deduplication removed {} redundant keyboxes", removed_count)
 
             try:
-                moved_count, replaced_latest = await self._quarantine_revoked_keyboxes()
+                moved_count, replaced_latest = await self._run_keybox_maintenance()
             except Exception as exc:
                 logger.warning("Startup revocation maintenance failed: {}", exc)
                 return
@@ -381,12 +403,42 @@ class KeyboxScavengerUserbot:
             else:
                 logger.info("Startup revocation maintenance complete with no changes")
 
-    async def _quarantine_revoked_keyboxes(self) -> tuple[int, bool]:
+    async def _watch_expirations(self) -> None:
+        while not self._expiration_watch_stop.is_set():
+            self._expiration_schedule_changed.clear()
+            timeout = self._seconds_until_next_expiration()
+            try:
+                await asyncio.wait_for(self._expiration_schedule_changed.wait(), timeout=timeout)
+                continue
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                async with self._revocation_maintenance_lock:
+                    moved_count, replaced_latest = await self._run_keybox_maintenance()
+                logger.info(
+                    "Expiration maintenance complete moved={} replaced_latest={}",
+                    moved_count,
+                    replaced_latest,
+                )
+            except Exception as exc:
+                logger.warning("Expiration maintenance failed: {}", exc)
+                # Avoid a hot loop if maintenance keeps failing on an already-past expiration.
+                await asyncio.sleep(60)
+
+    def _seconds_until_next_expiration(self) -> float | None:
+        if self._next_expiration is None:
+            return None
+        remaining = (self._next_expiration - datetime.now(timezone.utc)).total_seconds()
+        # Wake slightly after the expiration so the validator sees the certificate as expired.
+        return max(remaining, 0) + 1
+
+    async def _run_keybox_maintenance(self) -> tuple[int, bool]:
         output_dir = self.storage.output_dir
         revoked_dir = output_dir / "revoked"
         revoked_dir.mkdir(parents=True, exist_ok=True)
 
-        candidate_payloads: list[tuple[float, bytes]] = []
+        candidates: list[KeyboxCandidate] = []
         moved_count = 0
 
         for keybox_path in self._repository_keyboxes(output_dir):
@@ -402,30 +454,37 @@ class KeyboxScavengerUserbot:
                 logger.warning("Failed to validate keybox {}: {}", keybox_path, exc)
                 continue
 
-            if result.revoked_serials:
+            if result.revoked_serials or result.has_expired_certificate:
                 destination = self._next_revoked_destination(revoked_dir, keybox_path)
                 keybox_path.replace(destination)
                 moved_count += 1
-                logger.warning("Moved revoked keybox {} to {}", keybox_path, destination)
+                logger.warning(
+                    "Moved {} keybox {} to {}",
+                    "revoked" if result.revoked_serials else "expired",
+                    keybox_path,
+                    destination,
+                )
                 continue
 
             if result.is_valid:
-                candidate_payloads.append((keybox_path.stat().st_mtime, payload))
+                candidates.append(
+                    KeyboxCandidate(
+                        payload=payload,
+                        is_rkp=result.is_rkp,
+                        is_complete=self._is_complete_keybox(payload),
+                        expiration=result.nearest_expiration_date,
+                        mtime_ns=keybox_path.stat().st_mtime_ns,
+                    )
+                )
 
-        latest_path = output_dir / "keybox.xml"
+        expirations = [candidate.expiration for candidate in candidates if candidate.expiration]
+        self._next_expiration = min(expirations) if expirations else None
+        self._expiration_schedule_changed.set()
+
         replaced_latest = False
-        if latest_path.exists():
-            try:
-                latest_payload = latest_path.read_bytes()
-                latest_result = await self.validator.validate(latest_payload)
-            except Exception as exc:
-                logger.warning("Failed to validate latest keybox {}: {}", latest_path, exc)
-            else:
-                if latest_result.revoked_serials:
-                    replacement_payload = self._select_replacement_payload(candidate_payloads)
-                    if replacement_payload is not None:
-                        self.storage.persist(replacement_payload)
-                        replaced_latest = True
+        best = self._select_latest_candidate(candidates)
+        if best is not None:
+            replaced_latest = self.storage.write_latest(best.payload)
 
         return moved_count, replaced_latest
 
@@ -574,8 +633,30 @@ class KeyboxScavengerUserbot:
             index += 1
 
     @staticmethod
-    def _select_replacement_payload(candidate_payloads: list[tuple[float, bytes]]) -> bytes | None:
-        if not candidate_payloads:
+    def _is_complete_keybox(payload: bytes) -> bool:
+        # Stored payloads are normalized, so the algorithm label is derived from the key material.
+        try:
+            root = ET.fromstring(payload)
+        except ET.ParseError:
+            return False
+        algorithms = {
+            (key.get("algorithm") or "").strip().lower()
+            for key in root.findall(".//Keybox/Key")
+        }
+        return {"ecdsa", "rsa"} <= algorithms
+
+    @staticmethod
+    def _select_latest_candidate(candidates: list[KeyboxCandidate]) -> KeyboxCandidate | None:
+        # Priority: RKP first, then complete (ecdsa + rsa), then the soonest expiration.
+        # Ties go to the most recently stored keybox.
+        if not candidates:
             return None
-        candidate_payloads.sort(key=lambda item: item[0], reverse=True)
-        return candidate_payloads[0][1]
+        return min(
+            candidates,
+            key=lambda candidate: (
+                not candidate.is_rkp,
+                not candidate.is_complete,
+                candidate.expiration or datetime.max.replace(tzinfo=timezone.utc),
+                -candidate.mtime_ns,
+            ),
+        )

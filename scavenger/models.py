@@ -16,6 +16,8 @@ class ValidationResult:
     has_leaked_serial: bool = False
     special_serial_violation: bool = False
     nearest_expiration_date: datetime | None = None
+    has_expired_certificate: bool = False
+    is_rkp: bool = False
 
 
 @dataclass

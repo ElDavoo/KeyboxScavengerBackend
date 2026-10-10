@@ -28,6 +28,8 @@ if TYPE_CHECKING:
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ROOT_GOOGLE_PEM_PATH = PROJECT_ROOT / "res/pem/google.pem"
+# "Key Attestation CA1": the newer Google root that RKP-provisioned chains end at.
+ROOT_GOOGLE_RKP_PEM_PATH = PROJECT_ROOT / "res/pem/google_rkp.pem"
 ROOT_AOSP_EC_PEM_PATH = PROJECT_ROOT / "res/pem/aosp_ec.pem"
 ROOT_AOSP_RSA_PEM_PATH = PROJECT_ROOT / "res/pem/aosp_rsa.pem"
 ROOT_KNOX_PEM_PATH = PROJECT_ROOT / "res/pem/knox.pem"
@@ -58,6 +60,7 @@ class KeyboxValidator:
         self._revocation_updated_since_last_check = False
 
         self._google_public_key = self._load_public_key(ROOT_GOOGLE_PEM_PATH)
+        self._google_rkp_public_key = self._load_public_key(ROOT_GOOGLE_RKP_PEM_PATH)
         self._aosp_ec_public_key = self._load_public_key(ROOT_AOSP_EC_PEM_PATH)
         self._aosp_rsa_public_key = self._load_public_key(ROOT_AOSP_RSA_PEM_PATH)
         self._knox_public_key = self._load_public_key(ROOT_KNOX_PEM_PATH)
@@ -201,6 +204,8 @@ class KeyboxValidator:
         certificate_type: str | None = None
         if self._compare_keys(root_public_key, self._google_public_key):
             certificate_type = "hardware"
+        elif self._compare_keys(root_public_key, self._google_rkp_public_key):
+            certificate_type = "hardware"
         elif self._compare_keys(root_public_key, self._aosp_ec_public_key):
             certificate_type = "software"
         elif self._compare_keys(root_public_key, self._aosp_rsa_public_key):
@@ -262,6 +267,8 @@ class KeyboxValidator:
             has_leaked_serial=has_leaked_serial,
             special_serial_violation=special_serial_violation,
             nearest_expiration_date=nearest_expiration_date,
+            has_expired_certificate=any_certificate_expired,
+            is_rkp=self._is_rkp_chain(certificates),
         )
 
     async def _load_revocation_status(self) -> dict:
@@ -564,6 +571,19 @@ class KeyboxValidator:
             if attr.oid._name == "serialNumber":
                 return attr.value.lower()
         return None
+
+    @staticmethod
+    def _is_rkp_chain(certificates: list[x509.Certificate]) -> bool:
+        # RKP leaves are issued by Google's short-lived "Droid CA" intermediates,
+        # while factory-provisioned keyboxes use OEM intermediates.
+        for certificate in certificates[1:-1]:
+            organizations = certificate.subject.get_attributes_for_oid(x509.NameOID.ORGANIZATION_NAME)
+            common_names = certificate.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            if any(attr.value == "Google LLC" for attr in organizations) and any(
+                str(attr.value).startswith("Droid CA") for attr in common_names
+            ):
+                return True
+        return False
 
     @staticmethod
     def _verify_certificate_chain(certificates: list[x509.Certificate]) -> bool:
